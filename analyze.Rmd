@@ -1,0 +1,497 @@
+---
+title: "ISGlobal Twitter Analysis"
+output:
+  html_document: default
+  word_document: default
+  code_folding: hide
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = NA, 
+               echo = FALSE, 
+               warning = FALSE, 
+               message = FALSE, 
+               error = TRUE, 
+               cache = FALSE,
+  fig.path = "figures/",
+  out.width = "100%"
+)
+```
+
+```{r}
+cat('Documented rendered at: ', as.character(Sys.time()))
+## Load libraries
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(readr)
+library(gsheet)
+library(anytime)
+library(databrew)
+library(readr)
+options(scipen = '999')
+ggplot2::theme_set(theme_bw())
+```
+
+```{r}
+if('df.RData' %in% dir()){
+  load('df.RData')
+} else {
+  stop('First run "get_data.R"')
+}
+if('data.RData' %in% dir()){
+  load('data.RData')
+} else {
+  # Read in all tweet data
+  users <- dir('tweets')
+  data_list <- list()
+  for(i in 1:length(users)){
+    message('Reading user ', i, ' of ', length(users))
+    this_user <- users[i]
+    this_file <- paste0('tweets/', this_user)
+    this_data <- read_delim(this_file, delim = '\t')
+    data_list[[i]] <- this_data
+  }
+  tweets <- bind_rows(data_list)
+  
+  # Read in all user data
+  followers_list <- friends_list <- users_list <- list()
+  user_folders <- dir('users')
+  for(i in 1:length(user_folders)){
+    message(i, ' of ', length(user_folders))
+    this_user <- user_folders[i]
+    followers_path <- paste0('users/', this_user, '/followers.csv')
+    friends_path <- paste0('users/', this_user, '/friends.csv')
+    user_path <- paste0('users/', this_user, '/user.csv')
+    followers <- read_delim(followers_path, delim = '\t') %>%
+      mutate(username = this_user)
+    friends <- read_csv(friends_path) %>%
+      mutate(username = this_user)
+    user <- read_csv(user_path) %>%
+      mutate(username = this_user)
+    followers_list[[i]] <- followers
+    friends_list[[i]] <- friends
+    users_list[[i]] <- user
+  }
+  
+  followers <- bind_rows(followers_list)
+  friends <- bind_rows(friends_list)
+  users <- bind_rows(users_list)
+  friends <- left_join(friends, users %>% dplyr::select(username = screen_name,
+                                                        this_id = user_id))
+  followers <- left_join(followers, users %>% dplyr::select(username = screen_name,
+                                                        this_id = user_id))
+  save(followers, friends, users, tweets,
+       file = 'data.RData')
+}
+# Get who is being retweeted
+tweets$who_rt <- unlist(lapply(strsplit(tweets$quote_url, '/'), function(y){tolower(y[4])}))
+```
+
+## Aggregate account-level data
+
+```{r}
+pd <- users %>% dplyr::select(screen_name,
+                              name,
+                              country,
+                              # status_url,
+                              description,
+                              followers_count,
+                              following_count = friends_count,
+                              `In how many lists` =listed_count,
+                              tweets = statuses_count,
+                              account_created_at)
+databrew::prettify(pd, download_options = TRUE, nrows = nrow(pd))
+```
+
+## In-network visualization
+
+```{r, fig.height = 12, fig.width = 12}
+if('out.RData' %in% dir()){
+  load('out.RData')
+} else {
+  out_list <- list()
+  user_ids <- sort(unique(users$user_id))
+  counter <- 0
+  for(i in 1:length(user_ids)){
+    for(j in 1:length(user_ids)){
+      counter <- counter + 1
+      message(counter)
+      ids <- c(user_ids[i], user_ids[j])
+      ids <- sort(ids)
+      id_from <- ids[1]
+      id_to <- ids[2]
+      one_way <- friends %>% filter(this_id == id_from) %>%
+        filter(user_id == id_to)
+      other_way <- friends %>% filter(this_id == id_to) %>%
+        filter(user_id == id_from)
+      total_value <- nrow(one_way) + nrow(other_way)
+      out <- tibble(id_from,
+                    id_to,
+                    total_value)
+      out_list[[counter]] <- out
+    }
+  }
+  out <- bind_rows(out_list)
+  out <- out %>% dplyr::distinct(id_from, id_to, .keep_all = TRUE)
+  save(out, file = 'out.RData')
+}
+out <- out %>% filter(total_value > 0,
+                      id_from != id_to)
+
+# Create nodes and links
+unique_ids <- sort(unique(c(out$id_from, out$id_to)))
+nodes <- tibble(user_id = unique_ids) %>%
+  left_join(users %>% dplyr::select(user_id, name))
+links <- out %>% dplyr::rename(source = id_from,
+                               target = id_to,
+                               value = total_value)
+# Zero index everything
+nodes$id <- as.numeric(factor(nodes$user_id)) - 1
+links <- links %>%
+  left_join(nodes %>% dplyr::select(source = user_id,
+                                    source_id = id)) %>%
+  left_join(nodes %>% dplyr::select(target = user_id,
+                                    target_id = id)) %>%
+  dplyr::select(-source, -target) %>%
+  dplyr::rename(source = source_id,
+                target = target_id)
+nodes$group <- 1
+library(networkD3)
+
+network <- forceNetwork(Links = links, Nodes = nodes, Source = "source",
+             Target = "target", Value = "value", NodeID = "name",
+             charge = -150,
+             fontSize = 15,
+             height = 1200, width = 800,
+             Group = "group", opacity = 1, zoom = T, #bounded = T,
+             opacityNoHover = 1)
+network
+```
+
+## Ranking of followers
+
+```{r, fig.height = 12}
+pd <- users %>%
+  dplyr::select(screen_name, followers_count) %>%
+  arrange((followers_count)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = followers_count)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'Followers (log scale)') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+## Ranking of following
+
+```{r, fig.height = 12}
+pd <- users %>%
+  dplyr::select(screen_name, friends_count) %>%
+  arrange((friends_count)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = friends_count)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'Number of people following (log scale)') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+
+## Ranking of total tweets
+
+```{r, fig.height = 12}
+pd <- tweets %>%
+  group_by(screen_name = username) %>% 
+  tally %>%
+  arrange(desc(n)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = n)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'All-time tweets (log scale)') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+## "Virality" (average number of retweets)
+
+```{r, fig.height = 12}
+pd <- tweets %>%
+  group_by(screen_name = username) %>% 
+  summarise(retweets = mean(retweets_count)) %>%
+  arrange(desc(retweets)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = retweets)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'Average number of retweets (log scale)') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+## "Virality" (average number of retweets) in 2021 only
+
+```{r, fig.height = 12}
+pd <- tweets %>%
+  filter(date >= as.Date('2020-12-31')) %>%
+  group_by(screen_name = username) %>% 
+  summarise(retweets = mean(retweets_count)) %>%
+  arrange(desc(retweets)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = retweets)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'Average number of retweets (log scale)') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+## Who do ISGlobal tweeters retweet?
+
+```{r, fig.height = 12}
+pd <- tweets %>%
+  filter(who_rt != username) %>%
+  filter(!is.na(who_rt)) %>%
+  group_by(who_rt) %>%
+  tally %>%
+  arrange(desc(n)) %>%
+  filter(n>=10)
+pd$who_rt <- factor(pd$who_rt, levels = pd$who_rt)
+
+
+```
+
+Of the `r nrow(tweets)` from the `r length(unique(tweets$username))` tweeters, `r sum(pd$n)` were retweets of other people's tweets. The accounts which were most retweeted by ISGlobal tweeters is shown below (includes only those accounts which were retweeted 5+ times, not limited to ISGlobal tweeters):
+
+```{r, fig.height = 12}
+ggplot(data = pd,
+       aes(x = who_rt,
+           y = n)) +
+    geom_point() +
+  labs(x = 'Name',
+       y = 'Number of retweets') +
+  coord_flip() +
+  scale_y_log10()
+```
+
+## Account creation dates
+
+```{r, fig.height = 12}
+pd <- users %>%
+  dplyr::select(screen_name, account_created_at) %>%
+  arrange((account_created_at)) %>%
+  filter(!is.na(screen_name))
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = account_created_at)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = 'Date of account creation') +
+  coord_flip()
+```
+
+## 2021 tweet frequency rate
+
+```{r, fig.height = 12}
+pd <- tweets %>%
+  filter(lubridate::year(date) >= 2021) %>%
+  group_by(screen_name = username) %>% 
+  tally %>%
+  arrange(desc(n)) %>%
+  filter(!is.na(screen_name))
+days_in_2021 <- as.numeric(max(tweets$date) - as.Date('2020-12-31'))
+pd$nn <- pd$n / days_in_2021
+pd$screen_name <- factor(pd$screen_name, levels = pd$screen_name)
+
+ggplot(data = pd,
+       aes(x = screen_name,
+           y = nn)) +
+  geom_point() +
+  labs(x = 'Name',
+       y = '2021 tweets per day (log scale)') +
+  coord_flip() 
+```
+
+## Aggregate word cloud
+
+```{r, fig.height = 8, fig.width = 8}
+library(wordcloud2)
+make_word_cloud <- function(person = NULL){
+  # Get freqs
+  if(is.null(person)){
+    all_words <- paste0(tweets$tweet, collapse = ' ')
+  } else {
+    sub_tweets <- tweets %>% filter(username %in% person)
+    all_words <- paste0(sub_tweets$tweet, collapse = ' ')
+  }
+  
+  freqs <- strsplit(all_words, ' ')
+  freqs <- unlist(freqs) 
+  freqs <- tolower(freqs)
+  freqs <- trimws(freqs)
+  freq_df <- tibble(word = freqs)
+  freq_df <- freq_df %>%
+    group_by(word) %>%
+    summarise(freq = n()) %>%
+    arrange(desc(freq))
+  stop_words_es <- readLines('https://raw.githubusercontent.com/Alir3z4/stop-words/master/spanish.txt')
+  stop_words_en <- readLines('https://raw.githubusercontent.com/Alir3z4/stop-words/master/english.txt')
+  stop_words_ca <- readLines('https://raw.githubusercontent.com/Alir3z4/stop-words/master/catalan.txt')
+  stop_words_fr <- readLines('https://raw.githubusercontent.com/Alir3z4/stop-words/master/french.txt')
+  stop_words <- sort(unique(c(stop_words_ca,
+                              stop_words_en,
+                              stop_words_es,
+                              stop_words_fr)))
+  freq_df <- freq_df %>%
+    filter(!word %in% stop_words) %>%
+    filter(nchar(word) > 3) %>%
+    filter(!grepl('@', word),
+           word != '&amp;')
+  
+  return(wordcloud2(data = freq_df))
+}
+make_word_cloud()
+```
+
+## Person-specific charts
+
+### Virality over time
+
+The below charts show average number of retweets per user per month.
+
+```{r}
+virality_over_time <- function(person = NULL){
+  # Get freqs
+  if(is.null(person)){
+    sub_tweets <- tweets
+  } else {
+    sub_tweets <- tweets %>% filter(username %in% person)
+  }
+  pd <- sub_tweets %>%
+    group_by(month = lubridate::floor_date(date, 'month')) %>%
+    summarise(avg = mean(retweets_count))
+  g <- ggplot(data = pd,
+         aes(x = month,
+             y = avg)) +
+    geom_line() +
+    labs(x = 'Month',
+         y = 'Avg. retweets',
+         title = person)
+  return(g)
+}
+
+persons <- sort(unique(tweets$username))
+for(i in 1:length(persons)){
+  this_person <- persons[i]
+  print(virality_over_time(person = this_person))
+}
+```
+
+### Reach over time
+
+The below charts show _total_ number of retweets per month. 
+
+```{r}
+virality_over_time <- function(person = NULL){
+  # Get freqs
+  if(is.null(person)){
+    sub_tweets <- tweets
+  } else {
+    sub_tweets <- tweets %>% filter(username %in% person)
+  }
+  pd <- sub_tweets %>%
+    group_by(month = lubridate::floor_date(date, 'month')) %>%
+    summarise(avg = sum(retweets_count))
+  g <- ggplot(data = pd,
+         aes(x = month,
+             y = avg)) +
+    geom_line() +
+    labs(x = 'Month',
+         y = 'Total retweets',
+         title = person)
+  return(g)
+}
+
+persons <- sort(unique(tweets$username))
+for(i in 1:length(persons)){
+  this_person <- persons[i]
+  print(virality_over_time(person = this_person))
+}
+```
+
+
+### Activity over time
+
+The below charts show _total_ number of tweets per month.
+
+```{r}
+virality_over_time <- function(person = NULL){
+  # Get freqs
+  if(is.null(person)){
+    sub_tweets <- tweets
+  } else {
+    sub_tweets <- tweets %>% filter(username %in% person)
+  }
+  pd <- sub_tweets %>%
+    group_by(month = lubridate::floor_date(date, 'month')) %>%
+    summarise(avg = n())
+  g <- ggplot(data = pd,
+         aes(x = month,
+             y = avg)) +
+    geom_line() +
+    labs(x = 'Month',
+         y = 'Total tweets',
+         title = person)
+  return(g)
+}
+
+persons <- sort(unique(tweets$username))
+for(i in 1:length(persons)){
+  this_person <- persons[i]
+  print(virality_over_time(person = this_person))
+}
+```
+
+
+### Person-specific word clouds
+
+The below charts show person-specific word clouds.
+
+```{r, results = 'asis'}
+persons <- sort(unique(tweets$username))
+for(i in 1:length(persons)){
+  this_person <- persons[i]
+  nm <- colnames(iris)[i]
+  cat(sprintf("\n\n#### %s\n\n", this_person))
+  cat("\n\n")
+  cat(knitr::knit_print(make_word_cloud(this_person)))
+  cat("\n\n")
+}
+```
